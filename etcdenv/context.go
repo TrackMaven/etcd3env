@@ -5,9 +5,11 @@ import (
 	"os"
 	"strings"
 	"time"
+	"context"
+
 
 	"github.com/cenkalti/backoff"
-	"github.com/coreos/go-etcd/etcd"
+	"github.com/coreos/etcd/clientv3"
 	"github.com/upfluence/goutils/log"
 )
 
@@ -16,14 +18,15 @@ type Context struct {
 	Runner            *Runner
 	ExitChan          chan bool
 	ShutdownBehaviour string
-	WatchedKeys       []string
+	WatchedPrefix	  string
+	Watches           map[string]clientv3.WatchChan
 	CurrentEnv        map[string]string
 	maxRetry          int
-	etcdClient        *etcd.Client
+	etcdClient        *clientv3.Client
 }
 
-func NewContext(namespaces []string, endpoints, command []string,
-	shutdownBehaviour string, watchedKeys []string) (*Context, error) {
+func NewClient(namespaces []string, endpoints, command []string,
+	shutdownBehaviour string, watchedPrefix string) (*Context, error) {
 
 	if shutdownBehaviour != "keepalive" && shutdownBehaviour != "restart" &&
 		shutdownBehaviour != "exit" {
@@ -33,13 +36,23 @@ func NewContext(namespaces []string, endpoints, command []string,
 			)
 	}
 
+	client, err := clientv3.New(clientv3.Config{
+		Endpoints:   endpoints,
+		DialTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		log.Errorf("Could not connect to server: %s", err.Error())
+		return nil, err
+	}
+
 	return &Context{
 		Namespaces:        namespaces,
 		Runner:            NewRunner(command),
-		etcdClient:        etcd.NewClient(endpoints),
+		etcdClient:        client,
 		ShutdownBehaviour: shutdownBehaviour,
 		ExitChan:          make(chan bool),
-		WatchedKeys:       watchedKeys,
+		WatchedPrefix:     watchedPrefix,
+		Watches:		   make(map[string]clientv3.WatchChan),
 		CurrentEnv:        make(map[string]string),
 		maxRetry:          3,
 	}, nil
@@ -56,39 +69,21 @@ func (ctx *Context) escapeNamespace(key string) string {
 	return strings.TrimPrefix(key, "/")
 }
 
-func (ctx *Context) fetchEtcdNamespaceVariables(namespace string, currentRetry int, b *backoff.ExponentialBackOff) map[string]string {
-	result := make(map[string]string)
+func (ctx *Context) fetchEtcdNamespaceVariables(namespace string, currentRetry int, b *backoff.ExponentialBackOff) (map[string]string, error) {
+	vars := make(map[string]string)
 
-	response, err := ctx.etcdClient.Get(namespace, false, false)
-
+	con, cancel := context.WithTimeout(context.Background(), time.Duration(3)*time.Second)
+	resp, err := ctx.etcdClient.Get(con, namespace, clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortDescend))
+	cancel()
 	if err != nil {
 		log.Errorf("etcd fetching error: %s", err.Error())
-
-		if e, ok := err.(*etcd.EtcdError); ok && e.ErrorCode == etcd.ErrCodeEtcdNotReachable {
-			log.Error("Can't join the etcd server, fallback to the env variables")
-		} else if e, ok := err.(*etcd.EtcdError); ok && e.ErrorCode == ErrKeyNotFound {
-			log.Error("The namespace does not exist, fallback to the env variables")
-		}
-
-		if currentRetry < ctx.maxRetry {
-			log.Info("retry fetching variables")
-			t := b.NextBackOff()
-			time.Sleep(t)
-			return ctx.fetchEtcdNamespaceVariables(namespace, currentRetry+1, b)
-		} else {
-			return result
-		}
-
+		return vars, err
+	}
+	for _, ev := range resp.Kvs {
+		vars[strings.Replace(string(ev.Key), namespace, "", -1)] = string(ev.Value)
 	}
 
-	for _, node := range response.Node.Nodes {
-		key := ctx.escapeNamespace(node.Key)
-		if _, ok := result[key]; !ok {
-			result[key] = node.Value
-		}
-	}
-
-	return result
+	return vars, nil
 }
 
 func (ctx *Context) fetchEtcdVariables() map[string]string {
@@ -98,8 +93,12 @@ func (ctx *Context) fetchEtcdVariables() map[string]string {
 
 	for _, namespace := range ctx.Namespaces {
 		b.Reset()
-
-		for key, value := range ctx.fetchEtcdNamespaceVariables(namespace, 0, b) {
+		response, err := ctx.fetchEtcdNamespaceVariables(namespace, 0, b)
+		if err != nil {
+			log.Errorf("etcd fetching error: %s", err.Error())
+			return nil
+		}
+		for key, value := range response {
 			if _, ok := result[key]; !ok {
 				result[key] = value
 			}
@@ -109,58 +108,82 @@ func (ctx *Context) fetchEtcdVariables() map[string]string {
 	return result
 }
 
-func (ctx *Context) shouldRestart(envVar, value string) bool {
-	if v, ok := ctx.CurrentEnv[envVar]; ok && v == value {
-		return false
-	}
-
-	if len(ctx.WatchedKeys) == 0 || containsString(ctx.WatchedKeys, envVar) {
-		return true
-	}
-
-	return false
-}
-
 func (ctx *Context) Run() {
 	ctx.CurrentEnv = ctx.fetchEtcdVariables()
 	ctx.Runner.Start(ctx.CurrentEnv)
 
-	responseChan := make(chan *etcd.Response)
+	responseChan := make(chan *clientv3.WatchResponse)
 	processExitChan := make(chan int)
 
-	for _, namespace := range ctx.Namespaces {
-		go func(namespace string) {
-			var t time.Duration
-			b := backoff.NewExponentialBackOff()
-			b.Reset()
+	if len(ctx.WatchedPrefix) > 0 {
+		con, cancel := context.WithCancel(context.Background())
+		cancelRoutine := make(chan bool)
+		defer close(cancelRoutine)
 
-			for {
-				resp, err := ctx.etcdClient.Watch(namespace, 0, true, nil, ctx.ExitChan)
+		go func() {
+			select {
+			case <-ctx.ExitChan:
+				cancel()
+			case <-cancelRoutine:
+				return
+			}
+		}()
 
-				if err != nil {
-					log.Errorf("etcd fetching error: %s", err.Error())
+		rch := ctx.Watches[ctx.WatchedPrefix]
+		if rch == nil {
+			rch = ctx.etcdClient.Watch(con, ctx.WatchedPrefix, clientv3.WithPrefix())
+			ctx.Watches[ctx.WatchedPrefix] = rch
+		}
 
-					if e, ok := err.(*etcd.EtcdError); ok && e.ErrorCode == etcd.ErrCodeEtcdNotReachable {
-						t = b.NextBackOff()
-						log.Noticef("Can't join the etcd server, wait %v", t)
-						time.Sleep(t)
+		for wresp := range rch {
+			for _, ev := range wresp.Events {
+				log.Debug("Key updated %s", string(ev.Kv.Key))
+				// Only return if we have a key prefix we care about.
+				// This is not an exact match on the key so there is a chance
+				// we will still pickup on false positives. The net win here
+				// is reducing the scope of keys that can trigger updates.
+				for _, k := range ctx.CurrentEnv {
+					if strings.HasPrefix(string(ev.Kv.Key), k) {
+						responseChan <- &wresp
 					}
-
-					if t == backoff.Stop {
-						return
-					} else {
-						continue
-					}
-				}
-
-				log.Infof("%s key changed", resp.Node.Key)
-
-				if ctx.shouldRestart(ctx.escapeNamespace(resp.Node.Key), resp.Node.Value) {
-					responseChan <- resp
 				}
 			}
-		}(namespace)
+		}
 	}
+
+	// for _, namespace := range ctx.Namespaces {
+	// 	go func(namespace string) {
+	// 		var t time.Duration
+	// 		b := backoff.NewExponentialBackOff()
+	// 		b.Reset()
+
+	// 		for {
+	// 			resp, err := ctx.etcdClient.Watch(namespace, 0, true, nil, ctx.ExitChan)
+
+	// 			if err != nil {
+	// 				log.Errorf("etcd fetching error: %s", err.Error())
+
+	// 				if e, ok := err.(*rpctypes.EtcdError); ok && e.ErrorCode == clientv3.ErrCodeEtcdNotReachable {
+	// 					t = b.NextBackOff()
+	// 					log.Noticef("Can't join the etcd server, wait %v", t)
+	// 					time.Sleep(t)
+	// 				}
+
+	// 				if t == backoff.Stop {
+	// 					return
+	// 				} else {
+	// 					continue
+	// 				}
+	// 			}
+
+	// 			log.Infof("%s key changed", resp.Node.Key)
+
+	// 			if ctx.shouldRestart(ctx.escapeNamespace(resp.Node.Key), resp.Node.Value) {
+	// 				responseChan <- resp
+	// 			}
+	// 		}
+	// 	}(namespace)
+	// }
 
 	go ctx.Runner.WatchProcess(processExitChan)
 

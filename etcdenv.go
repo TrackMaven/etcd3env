@@ -1,16 +1,3 @@
-/*
-   Copyright 2014 Upfluence, Inc.
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-       http://www.apache.org/licenses/LICENSE-2.0
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-*/
-
 package main
 
 import (
@@ -20,31 +7,30 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-
-	"github.com/upfluence/etcdenv/etcdenv"
+	"./etcdenv"
 	"github.com/upfluence/goutils/log"
 )
 
 const currentVersion = "0.4.0"
 
 var (
-	flagset = flag.NewFlagSet("etcdenv", flag.ExitOnError)
+	flagset = flag.NewFlagSet("etcd3env", flag.ExitOnError)
 	flags   = struct {
 		Version           bool
 		ShutdownBehaviour string
 		Server            string
 		Namespace         string
-		WatchedKeys       string
+		WatchedPrefix     string
 	}{}
 )
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `
   NAME
-  etcdenv - use your etcd keys as environment variables
+  etcd3env - use your etcd keys as environment variables
 
   USAGE
-  etcdenv [options] <command>
+  etcd3env [options] <command>
 
   OPTIONS
   `)
@@ -64,13 +50,11 @@ func init() {
 	flagset.StringVar(&flags.Namespace, "namespace", "/environments/production", "etcd directory where the environment variables are fetched")
 	flagset.StringVar(&flags.Namespace, "n", "/environments/production", "etcd directory where the environment variables are fetched")
 
-	flagset.StringVar(&flags.WatchedKeys, "watched", "", "environment variables to watch, comma-separated")
-	flagset.StringVar(&flags.WatchedKeys, "w", "", "environment variables to watch, comma-separated")
+	flagset.StringVar(&flags.WatchedPrefix, "watched", "", "environment variables prefix to watch")
+	flagset.StringVar(&flags.WatchedPrefix, "w", "", "environment variables prefix to watch")
 }
 
 func main() {
-	var watchedKeysList []string
-
 	flagset.Parse(os.Args[1:])
 	flagset.Usage = usage
 
@@ -80,25 +64,19 @@ func main() {
 	}
 
 	if flags.Version {
-		fmt.Printf("etcdenv v%s", currentVersion)
+		fmt.Printf("etcd3env v%s", currentVersion)
 		os.Exit(0)
 	}
 
 	signalChan := make(chan os.Signal)
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 
-	if flags.WatchedKeys == "" {
-		watchedKeysList = []string{}
-	} else {
-		watchedKeysList = strings.Split(flags.WatchedKeys, ",")
-	}
-
-	ctx, err := etcdenv.NewContext(
+	cli, err := etcdenv.NewClient(
 		strings.Split(flags.Namespace, ","),
 		[]string{flags.Server},
 		flagset.Args(),
 		flags.ShutdownBehaviour,
-		watchedKeysList,
+		flags.WatchedPrefix,
 	)
 
 	if err != nil {
@@ -106,13 +84,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	go ctx.Run()
+	go cli.Run()
 
 	select {
 	case sig := <-signalChan:
 		log.Noticef("Received signal %s", sig)
-		ctx.ExitChan <- true
-	case <-ctx.ExitChan:
-		log.Infof("Catching ExitChan, doing nothin'")
+		cli.ExitChan <- true
+	case <-cli.ExitChan:
+		log.Infof("Catching ExitChan, doing nothing")
 	}
 }
