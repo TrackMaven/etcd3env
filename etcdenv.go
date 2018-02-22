@@ -11,7 +11,7 @@ import (
 	"github.com/upfluence/goutils/log"
 )
 
-const currentVersion = "0.4.0"
+const currentVersion = "1.0.0"
 
 var (
 	flagset = flag.NewFlagSet("etcd3env", flag.ExitOnError)
@@ -20,7 +20,6 @@ var (
 		ShutdownBehaviour string
 		Server            string
 		Namespace         string
-		WatchedPrefix     string
 	}{}
 )
 
@@ -49,9 +48,6 @@ func init() {
 
 	flagset.StringVar(&flags.Namespace, "namespace", "/environments/production", "etcd directory where the environment variables are fetched")
 	flagset.StringVar(&flags.Namespace, "n", "/environments/production", "etcd directory where the environment variables are fetched")
-
-	flagset.StringVar(&flags.WatchedPrefix, "watched", "", "environment variables prefix to watch")
-	flagset.StringVar(&flags.WatchedPrefix, "w", "", "environment variables prefix to watch")
 }
 
 func main() {
@@ -76,7 +72,6 @@ func main() {
 		[]string{flags.Server},
 		flagset.Args(),
 		flags.ShutdownBehaviour,
-		flags.WatchedPrefix,
 	)
 
 	if err != nil {
