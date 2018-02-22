@@ -84,6 +84,11 @@ func (ctx *Context) fetchEtcdVariables() map[string]string {
     result := make(map[string]string)
 
     for _, namespace := range ctx.Namespaces {
+        // Namespaces should end with a trailing slash.
+        // As a safety mechanism, append one automatically if not given
+        if !strings.HasSuffix(namespace, "/") {
+            namespace = namespace + "/"
+        }
         response := ctx.fetchEtcdNamespaceVariables(namespace)
 
         for key, value := range response {
