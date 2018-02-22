@@ -81,6 +81,7 @@ func (ctx *Context) fetchEtcdNamespaceVariables(namespace string) (map[string]st
 }
 
 func (ctx *Context) fetchEtcdVariables() map[string]string {
+    defer ctx.etcdClient.Close()
     result := make(map[string]string)
 
     for _, namespace := range ctx.Namespaces {
